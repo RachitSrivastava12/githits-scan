@@ -33,7 +33,7 @@ fn audit_ux_advisory_hints_are_not_presented_as_recommendations() {
 }
 
 #[test]
-fn audit_ux_override_shows_benefit_and_one_truthful_verification_note() {
+fn audit_ux_override_shows_benefit_and_conflicts_without_routine_disclaimer() {
     let mut value = remediation_report();
     let record = &mut value["remediation"]["recommendations"][0];
     record["changes"][0]["strategy"] = "override".into();
@@ -47,9 +47,9 @@ fn audit_ux_override_shows_benefit_and_one_truthful_verification_note() {
         .push(second);
     let text = human_report(&value);
     assert!(text.contains("would address the listed advisory"), "{text}");
-    assert_eq!(text.matches("override not verified:").count(), 1, "{text}");
+    assert!(!text.contains("override not verified:"), "{text}");
     assert!(
-        text.contains("package-manager support and build not checked"),
+        !text.contains("package-manager support and build not checked"),
         "{text}"
     );
     assert!(
@@ -57,6 +57,10 @@ fn audit_ux_override_shows_benefit_and_one_truthful_verification_note() {
         "{text}"
     );
     assert!(!text.contains("Suggested fix"), "{text}");
+    assert_eq!(
+        json_report(&value)["remediation"]["recommendations"][0]["checks"]["native_resolution"],
+        "not_checked"
+    );
     value["remediation"]["recommendations"][0]["checks"]["native_resolution"] =
         "future_check".into();
     let text = human_report(&value);
@@ -261,7 +265,7 @@ fn audit_ux_candidate_compresses_only_the_complete_displayed_advisory_set() {
     );
     assert!(
         text.contains("Dependency requirements conflict with this candidate.")
-            && text.contains("Candidate changes"),
+            && text.contains("Candidate upgrade:"),
         "{text}"
     );
     assert!(
@@ -286,10 +290,10 @@ fn audit_ux_candidate_compresses_only_the_complete_displayed_advisory_set() {
 #[test]
 fn audit_ux_shared_search_limits_preserve_the_requiring_package_scope() {
     for (cause, detail) in [
-        ("parent_candidate_limit", "service limit"),
+        ("parent_candidate_limit", "limit for checking"),
         ("assignment_limit", "combinations"),
-        ("parent_evidence_incomplete", "information"),
-        ("parent_exact_lookup_limit", "metadata checks"),
+        ("parent_evidence_incomplete", "metadata"),
+        ("parent_exact_lookup_limit", "looking up metadata"),
     ] {
         let mut value = remediation_report();
         value["remediation"]["status"] = "limited".into();
@@ -297,7 +301,8 @@ fn audit_ux_shared_search_limits_preserve_the_requiring_package_scope() {
         let text = human_report(&value);
         let shared = prose(text.split_once("planning limit:").expect("shared limit").1);
         assert!(
-            shared.contains("packages requiring vulnerable dependencies"),
+            (cause == "assignment_limit"
+                || shared.contains("packages that depend on this dependency")),
             "{cause}: {shared}"
         );
         assert!(
