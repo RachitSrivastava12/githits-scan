@@ -1,11 +1,13 @@
 //! One computation of qualification, impact and the explanations beside changes.
 use super::{context::Context, list, requirement_status, safe};
 use crate::api::audit::remediation::{Blocker, Checks};
+use crate::catalog::{self, Role};
 use crate::commands::audit::view::remediation::{
     Change as ChangeView, Finding, Record, Remediation, reasons::Reason,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 mod reasons;
 pub(in crate::commands::audit) use reasons::ReasonDetail;
 
@@ -15,6 +17,10 @@ const UNFAMILIAR_REASON: &str =
 /// Complete qualified guidance for one independent recommendation.
 #[derive(Serialize)]
 pub(in crate::commands::audit) struct Plan {
+    #[serde(skip)]
+    supported: bool,
+    #[serde(skip)]
+    clear_project_edit: bool,
     /// Shared title for joint changes; a single change carries its own qualification.
     pub heading: Option<String>,
     /// Separate outcome explanation when the title cannot express it.
@@ -40,6 +46,10 @@ pub(in crate::commands::audit) struct Plan {
 /// Explanation of one change, linked to its position in the owning fact record.
 #[derive(Serialize)]
 pub(in crate::commands::audit) struct Change {
+    #[serde(skip)]
+    compact: String,
+    #[serde(skip)]
+    application_issue: Option<String>,
     /// Position in the owning fact record’s changes array.
     #[serde(rename = "change_index")]
     pub index: usize,
@@ -60,6 +70,10 @@ pub(in crate::commands::audit) struct Constraint {
     pub summary: String,
     /// Sorted unique owner, requirement and path contexts for this explanation.
     pub details: Vec<String>,
+    #[serde(skip)]
+    compact_edit: Option<String>,
+    #[serde(skip)]
+    excludes_target: bool,
 }
 
 impl Plan {
@@ -71,35 +85,30 @@ impl Plan {
         detail: ReasonDetail,
     ) -> Self {
         let planning_known = matches!(status, "completed" | "limited");
-        let supported = supported_fix(r, planning_known);
+        let checked_upgrade = upgrade_evidence(r, planning_known);
+        let supported = checked_upgrade && r.checks.requirements == "matched";
         let common = common_paths(&r.changes);
         let files = common
             .clone()
             .filter(|files| files != &context.files() || files != &Context::record(r).files())
             .unwrap_or_default();
         let constraints = constraints(&r.blockers, detail);
-        let mut seen_limits = BTreeSet::new();
-        let mut limitations: Vec<_> = r
-            .limitations
-            .iter()
-            .filter(|l| l.as_str() != "withdrawal_not_observed")
-            .filter_map(|l| {
-                let message = explanation(l);
-                (!constraints.iter().any(|c| c.summary == message))
-                    .then(|| format!("limit: {message}"))
-            })
-            .filter(|message| seen_limits.insert(message.clone()))
+        let clear_project_edit = checked_upgrade && clear_project_edit(r, &constraints);
+        let mut limitations: Vec<_> = limitations(r, &constraints)
+            .map(|(_, message)| format!("limit: {message}"))
             .collect();
         if let Some(message) = super::search::retention(r) {
             limitations.push(message);
         }
-        let checks = checks(r);
+        let checks = checks(r, false);
         let search_explanations = super::search::explain(r);
         let has_details = !constraints.is_empty()
             || !checks.is_empty()
             || !limitations.is_empty()
             || !search_explanations.is_empty();
         Self {
+            supported,
+            clear_project_edit,
             heading: heading(r, supported),
             outcome: (!matches!(r.outcome.as_str(), "proposed" | "partial")
                 || r.changes.is_empty())
@@ -122,12 +131,195 @@ impl Plan {
                 .collect(),
             files,
             context: recorded_requests(r),
-            impact: impact(r, supported, context),
+            impact: impact(r, addressed_display(r, supported, context)),
             constraints,
             checks,
             limitations,
             search_explanations,
         }
+    }
+
+    /// Compose the inline summary and indicate whether a Details link is useful.
+    pub(super) fn compact(&self, r: &Record) -> (String, bool) {
+        let mut sentences = Vec::new();
+        if let Some(changes) = self.compact_changes(r) {
+            sentences.push(changes);
+        }
+        sentences.extend(self.outcome.iter().cloned());
+        let mut target_warnings = action_target_warnings(r).peekable();
+        let target_caveat = target_warnings.peek().is_some()
+            || self.changes.iter().any(|change| !change.details.is_empty());
+        let clear_edit = self.clear_project_edit && !target_caveat;
+        let mut issue = self.compact_issue(r, clear_edit);
+        let details_recommended = !(self.supported || clear_edit)
+            || self.outcome.is_some()
+            || r.outcome == "partial"
+            || !r.remaining_findings.is_empty()
+            || (issue.is_some() && !clear_edit)
+            || target_caveat;
+        sentences.extend(target_warnings.map(|label| format!("Includes a {label} target")));
+        if clear_edit {
+            sentences.extend(issue.take());
+        }
+        if self.supported
+            || clear_edit
+            || issue.is_none()
+            || (!r.remaining_findings.is_empty() && !self.changes.is_empty())
+        {
+            sentences.extend(impact(
+                r,
+                AddressedDisplay::Compact {
+                    supported: self.supported || clear_edit,
+                },
+            ));
+        }
+        sentences.extend(issue);
+        let summary = sentences
+            .into_iter()
+            .map(sentence)
+            .collect::<Vec<_>>()
+            .join(" ");
+        (summary, details_recommended)
+    }
+
+    fn compact_issue(&self, r: &Record, clear_edit: bool) -> Option<String> {
+        self.constraints
+            .iter()
+            .find(|constraint| constraint.excludes_target)
+            .map(|constraint| constraint.compact_text(clear_edit))
+            .or_else(|| self.compact_limit(r, "incompatible_recommendations"))
+            .or_else(|| {
+                target_checks(r)
+                    .next()
+                    .map(|(label, value)| check_line(label, value, true))
+            })
+            .or_else(|| self.compact_constraint(clear_edit))
+            .or_else(|| self.search_obstacle())
+            .or_else(|| {
+                self.changes
+                    .iter()
+                    .find_map(|change| change.application_issue.as_deref())
+                    .map(str::to_owned)
+            })
+            .or_else(|| self.compact_check(r))
+            .or_else(|| {
+                limitations(r, &self.constraints)
+                    .find(|(code, _)| !self.supported || !search_only_limit(code))
+                    .map(compact_limitation)
+            })
+            .or_else(|| {
+                self.changes
+                    .is_empty()
+                    .then(|| super::search::retention(r))
+                    .flatten()
+            })
+    }
+
+    fn compact_constraint(&self, clear_edit: bool) -> Option<String> {
+        self.constraints
+            .iter()
+            .find(|constraint| constraint.compact_edit.is_some())
+            .or_else(|| self.constraints.first())
+            .map(|constraint| constraint.compact_text(clear_edit))
+    }
+
+    fn compact_check(&self, r: &Record) -> Option<String> {
+        if self.supported {
+            return None;
+        }
+        checks(r, true).into_iter().next()
+    }
+
+    fn compact_limit(&self, r: &Record, reason: &str) -> Option<String> {
+        limitations(r, &self.constraints)
+            .find(|(code, _)| *code == reason)
+            .map(compact_limitation)
+    }
+
+    fn search_obstacle(&self) -> Option<String> {
+        if !self.changes.is_empty() {
+            return None;
+        }
+        self.search_explanations
+            .first()
+            .map(|explanation| explanation.summary.clone())
+    }
+
+    fn compact_changes(&self, r: &Record) -> Option<String> {
+        if self.changes.is_empty() {
+            return None;
+        }
+        let changes = self
+            .changes
+            .iter()
+            .map(|change| change.compact.as_str())
+            .collect::<Vec<_>>()
+            .join(" and ");
+        let action = if self.supported { "Bump " } else { "" };
+        let together = if self.changes.len() > 1 {
+            " together"
+        } else {
+            ""
+        };
+        let paths = self.compact_location(r);
+        Some(format!("{action}{changes}{together}{paths}"))
+    }
+
+    fn compact_location(&self, r: &Record) -> String {
+        if !self.supported || !self.constraints.is_empty() || !self.files.is_empty() {
+            return location(&self.files);
+        }
+        common_paths(&r.changes)
+            .filter(|paths| {
+                paths
+                    .iter()
+                    .all(|path| matches!(file_role(path), Some(Role::Lockfile(_))))
+            })
+            .map_or_else(String::new, |paths| location(&paths))
+    }
+}
+
+fn file_role(path: &str) -> Option<Role> {
+    catalog::classify(Path::new(path)).map(|file| file.role)
+}
+
+fn sentence(mut text: String) -> String {
+    if !text.ends_with('.') {
+        text.push('.');
+    }
+    text
+}
+
+fn capitalize(mut text: String) -> String {
+    if let Some(initial) = text.get_mut(..1) {
+        initial.make_ascii_uppercase();
+    }
+    text
+}
+
+fn location(paths: &BTreeSet<String>) -> String {
+    if paths.is_empty() {
+        return String::new();
+    }
+    format!(" in {}", list(paths))
+}
+
+impl Constraint {
+    fn compact_text(&self, clear_edit: bool) -> String {
+        match (&self.compact_edit, clear_edit) {
+            (Some(edit), true) => return format!("Update {edit}"),
+            (Some(edit), false) => {
+                return format!("Applying the proposal requires updating the {edit}");
+            }
+            (None, _) => {}
+        }
+        let requests = self.details.join(") and (");
+        let label = match (self.excludes_target, self.details.len()) {
+            (true, 1) => "Upgrade conflict on a requirement",
+            (true, _) => "Upgrade conflict on requirements",
+            (false, _) => self.summary.trim_end_matches('.'),
+        };
+        capitalize(format!("{label} ({requests})"))
     }
 }
 
@@ -141,12 +333,7 @@ fn heading(r: &Record, supported: bool) -> Option<String> {
         (false, "partial") => "Candidate changes (partial)",
         _ => "Candidate changes",
     };
-    let together = if r.changes.len() > 1 {
-        " — change together"
-    } else {
-        ""
-    };
-    Some(format!("{label}{together}"))
+    Some(format!("{label} — change together"))
 }
 
 fn change(
@@ -162,10 +349,12 @@ fn change(
     let known = planning_known
         && matches!(r.outcome.as_str(), "proposed" | "partial")
         && known_checks(&r.checks);
-    let action = match (known, data.strategy.as_str()) {
-        (true, "upgrade") if supported && r.changes.len() == 1 => "Suggested fix: Upgrade",
-        (true, "upgrade") if supported => "Upgrade",
-        (true, "upgrade") => "Candidate upgrade:",
+    let action = match (known, data.strategy.as_str(), r.changes.len() > 1) {
+        (true, "upgrade", true) if supported => "Upgrade",
+        (true, "upgrade", true) => "Upgrade of",
+        (_, _, true) => "Change",
+        (true, "upgrade", false) if supported => "Suggested fix: Upgrade",
+        (true, "upgrade", false) => "Candidate upgrade:",
         _ => "Candidate change:",
     };
     let partial = if r.changes.len() == 1 && r.outcome == "partial" {
@@ -173,23 +362,17 @@ fn change(
     } else {
         ""
     };
-    let mut details = Vec::new();
-    match data.strategy.as_str() {
-        "unknown" => {
-            details.push(
-                "The report lists version changes but does not specify how to apply them.".into(),
-            );
-        }
-        "upgrade" | "override" => {}
-        _ => {
-            details.push("The service returned an unfamiliar change strategy; applicability could not be determined.".into());
-        }
-    }
+    let (applicability, qualification) = change_strategy(&data.strategy);
+    let mut details: Vec<String> = applicability.into_iter().map(str::to_owned).collect();
+    let mut qualifiers = Vec::new();
     if !data.conflicting_target_versions.is_empty() {
-        details.push(format!(
-            "conflicting targets: {}",
-            list(&data.conflicting_target_versions)
-        ));
+        let targets = data
+            .conflicting_target_versions
+            .iter()
+            .map(|target| safe(target))
+            .collect::<Vec<_>>();
+        details.push(format!("conflicting targets: {}", targets.join(", ")));
+        qualifiers.push(format!("conflicts with {}", targets.join(" and ")));
     }
     for (label, flag) in [
         ("prerelease", data.prerelease_target),
@@ -197,21 +380,55 @@ fn change(
     ] {
         if flag == Some(true) {
             details.push(format!("target is {label}"));
+            qualifiers.push(label.into());
         }
     }
+    if data.strategy == "override" {
+        qualifiers.push("override proposal".into());
+    }
+    let files = data.paths.iter().filter(|_| show_files).cloned().collect();
+    let package = format!("{}:{}", safe(&data.registry), safe(&data.name));
+    let version_change = format!(
+        "{package} {} -> {}",
+        safe(&data.from_version),
+        safe(&data.target_version)
+    );
+    let note = if qualifiers.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", qualifiers.join(", "))
+    };
     Change {
         index,
-        summary: format!(
-            "{action} {}:{} {} -> {}{partial}",
-            safe(&data.registry),
-            safe(&data.name),
-            safe(&data.from_version),
-            safe(&data.target_version)
-        ),
+        compact: format!("{version_change}{note}{}", location(&files)),
+        application_issue: qualification
+            .map(|issue| application_issue(issue, &package, r.changes.len() > 1)),
+        summary: format!("{action} {version_change}{partial}"),
         details,
-        files: data.paths.iter().filter(|_| show_files).cloned().collect(),
+        files,
         reasons: reasons::explain(c, r, detail),
     }
+}
+
+fn change_strategy(strategy: &str) -> (Option<&'static str>, Option<&'static str>) {
+    match strategy {
+        "unknown" => (
+            Some("The report lists version changes but does not specify how to apply them."),
+            Some("The report does not specify how to update"),
+        ),
+        "override" | "upgrade" => (None, None),
+        _ => (
+            Some(
+                "The service returned an unfamiliar change strategy; applicability could not be determined.",
+            ),
+            Some("Scan does not recognize the update method for"),
+        ),
+    }
+}
+
+fn application_issue(issue: &str, package: &str, joint: bool) -> String {
+    let target = if joint { package } else { "this dependency" };
+    format!("{issue} {target}")
 }
 
 fn recorded_requests(r: &Record) -> Vec<String> {
@@ -241,36 +458,70 @@ fn recorded_requests(r: &Record) -> Vec<String> {
         .collect()
 }
 
-fn impact(r: &Record, supported: bool, context: &Context<'_>) -> Vec<String> {
-    let addressed: BTreeSet<_> = r.addressed_findings.iter().collect();
-    let covers = r.outcome == "proposed"
+#[derive(Clone, Copy)]
+enum AddressedDisplay {
+    Named,
+    Listed,
+    Omitted,
+    Compact { supported: bool },
+}
+
+fn addressed_display(r: &Record, supported: bool, context: &Context<'_>) -> AddressedDisplay {
+    if r.outcome == "proposed"
         && r.remaining_findings.is_empty()
-        && r.findings.iter().collect::<BTreeSet<_>>() == addressed
-        && context.matches(&r.findings);
+        && context.matches(&r.findings)
+        && r.findings.iter().collect::<BTreeSet<_>>()
+            == r.addressed_findings.iter().collect::<BTreeSet<_>>()
+    {
+        return if supported {
+            AddressedDisplay::Omitted
+        } else {
+            AddressedDisplay::Listed
+        };
+    }
+    AddressedDisplay::Named
+}
+
+fn impact(r: &Record, display: AddressedDisplay) -> Vec<String> {
     let mut lines = Vec::new();
-    let required_edit = r.checks.release_availability == "observed"
-        && r.checks.advisories == "non_affecting"
-        && known_checks(&r.checks)
-        && r.changes.iter().all(|c| c.data.strategy == "upgrade")
-        && !r.blockers.is_empty()
-        && r.blockers.iter().all(project_edit);
-    if !(r.addressed_findings.is_empty() || (supported || required_edit) && covers) {
-        lines.push(match (covers, r.addressed_findings.len()) {
-            (true, 1) => "would address the listed advisory".into(),
-            (true, _) => "would address all listed advisories".into(),
-            (false, _) => format!(
+    if !r.addressed_findings.is_empty() {
+        match display {
+            AddressedDisplay::Compact { supported: true } => lines.push(format!(
+                "Addresses {}",
+                finding_names(&r.addressed_findings, &r.remaining_findings, &r.subject)
+            )),
+            AddressedDisplay::Named => lines.push(format!(
                 "would address: {}",
                 finding_names(&r.addressed_findings, &r.remaining_findings, &r.subject)
-            ),
-        });
+            )),
+            AddressedDisplay::Listed if r.addressed_findings.len() == 1 => {
+                lines.push("would address the listed advisory".into());
+            }
+            AddressedDisplay::Listed => lines.push("would address all listed advisories".into()),
+            AddressedDisplay::Omitted | AddressedDisplay::Compact { supported: false } => {}
+        }
     }
-    if r.outcome == "partial" && r.addressed_findings.is_empty() {
-        lines.push("would address: none reported".into());
+    match display {
+        AddressedDisplay::Compact { supported: false }
+            if r.remaining_findings.is_empty() && !r.changes.is_empty() =>
+        {
+            lines.push("Upgrade not verified".into());
+        }
+        AddressedDisplay::Compact { .. } => {}
+        _ if r.outcome == "partial" && r.addressed_findings.is_empty() => {
+            lines.push("would address: none reported".into());
+        }
+        _ => {}
     }
     if !r.remaining_findings.is_empty() {
+        let remaining = finding_names(&r.remaining_findings, &r.addressed_findings, &r.subject);
         lines.push(format!(
-            "still unresolved: {}",
-            finding_names(&r.remaining_findings, &r.addressed_findings, &r.subject)
+            "{}{remaining}",
+            if matches!(display, AddressedDisplay::Compact { .. }) {
+                "Still open: "
+            } else {
+                "still unresolved: "
+            }
         ));
     }
     lines
@@ -281,23 +532,35 @@ fn impact(r: &Record, supported: bool, context: &Context<'_>) -> Vec<String> {
 fn project_edit(b: &Blocker) -> bool {
     b.owner_role == "project" && b.reason == "project_request_change"
 }
-fn edit_instruction(b: &Blocker) -> Option<String> {
+fn edit_instruction(b: &Blocker) -> Option<(String, String)> {
     if !project_edit(b) || b.requirement_status != "recorded" {
         return None;
     }
-    Some(format!(
-        "Update the {} requirement in {}. Current requirement: {}.",
-        safe(b.dependency_name.as_deref()?),
-        safe(&b.path),
-        safe(b.requested_requirement.as_deref()?)
+    let name = safe(b.dependency_name.as_deref()?);
+    let path = safe(&b.path);
+    let current = safe(b.requested_requirement.as_deref()?);
+    Some((
+        format!(
+            "Applying the candidate requires updating the {name} requirement in {path}. Current requirement: {current}."
+        ),
+        format!("version constraint for {name} in {path} (currently {current})"),
     ))
 }
 fn constraints(blockers: &[Blocker], detail: ReasonDetail) -> Vec<Constraint> {
     let mut groups: Vec<Constraint> = Vec::new();
     for b in blockers {
-        let instruction = edit_instruction(b);
-        let is_edit = instruction.is_some();
-        let summary = instruction.unwrap_or_else(|| constraint_reason(b));
+        let excludes_target = matches!(
+            b.reason.as_str(),
+            "third_party_request_excludes_target" | "required_request_excludes_target"
+        );
+        let (summary, compact_edit) = match edit_instruction(b) {
+            Some((full, compact)) => (full, Some(compact)),
+            None if excludes_target => (
+                "Dependency requirements conflict with this candidate.".into(),
+                None,
+            ),
+            None => (explanation(&b.reason), None),
+        };
         let request = format!(
             "{} {} [{}]",
             owner(&b.owner.name, b.owner.version.as_deref()),
@@ -308,7 +571,7 @@ fn constraints(blockers: &[Blocker], detail: ReasonDetail) -> Vec<Constraint> {
             ),
             safe(&b.path)
         );
-        let details = if is_edit && detail == ReasonDetail::Summary {
+        let details = if compact_edit.is_some() && detail == ReasonDetail::Summary {
             Vec::new()
         } else {
             vec![request]
@@ -317,7 +580,12 @@ fn constraints(blockers: &[Blocker], detail: ReasonDetail) -> Vec<Constraint> {
             group.details.extend(details);
             continue;
         }
-        groups.push(Constraint { summary, details });
+        groups.push(Constraint {
+            summary,
+            details,
+            compact_edit,
+            excludes_target,
+        });
     }
     for group in &mut groups {
         group.details.sort();
@@ -326,10 +594,58 @@ fn constraints(blockers: &[Blocker], detail: ReasonDetail) -> Vec<Constraint> {
     groups
 }
 
-fn checks(r: &Record) -> Vec<String> {
+fn limitations<'a>(
+    r: &'a Record,
+    constraints: &'a [Constraint],
+) -> impl Iterator<Item = (&'a str, String)> + 'a {
+    let mut seen = BTreeSet::new();
+    r.limitations
+        .iter()
+        .filter(|l| l.as_str() != "withdrawal_not_observed")
+        .map(|l| (l.as_str(), explanation(l)))
+        .filter(move |(_, message)| {
+            !constraints.iter().any(|c| c.summary == *message) && seen.insert(message.clone())
+        })
+}
+
+fn compact_limitation((code, message): (&str, String)) -> String {
+    match code {
+        "incompatible_recommendations" => "Do not combine conflicting recommendations".into(),
+        "checked_occurrence_changed_by_other_recommendation" => {
+            "Recheck before combining recommendations".into()
+        }
+        _ => capitalize(message),
+    }
+}
+
+// These limits describe the wider search rather than the supported change.
+fn search_only_limit(code: &str) -> bool {
+    matches!(
+        code,
+        "parent_candidate_limit"
+            | "parent_evidence_incomplete"
+            | "parent_exact_lookup_limit"
+            | "assignment_limit"
+    )
+}
+
+fn check_line(label: &str, value: &str, compact: bool) -> String {
+    match (compact, label, value) {
+        (true, "release availability", "unverified") => {
+            "Target release availability unverified".into()
+        }
+        (true, "requirements", "not_checked" | "unchecked") => "Requirements unchecked".into(),
+        (true, "requirements", "blocked") => {
+            "Upgrade conflicts with dependency requirements".into()
+        }
+        (true, _, _) => capitalize(format!("{label}: {}", check_text(value))),
+        (false, _, _) => format!("{label}: {}", check_text(value)),
+    }
+}
+
+fn target_checks(r: &Record) -> impl Iterator<Item = (&'static str, &str)> {
     let c = &r.checks;
-    let mut lines = Vec::new();
-    for (label, value, normal) in [
+    [
         (
             "release availability",
             c.release_availability.as_str(),
@@ -337,14 +653,21 @@ fn checks(r: &Record) -> Vec<String> {
         ),
         ("target advisories", c.advisories.as_str(), "non_affecting"),
         ("requirements", c.requirements.as_str(), "matched"),
-    ] {
-        if !r.changes.is_empty()
+    ]
+    .into_iter()
+    .filter(move |(label, value, normal)| {
+        !r.changes.is_empty()
             && value != normal
-            && !(label == "requirements" && value == "blocked" && !r.blockers.is_empty())
-        {
-            lines.push(format!("{label}: {}", check_text(value)));
-        }
-    }
+            && !(*label == "requirements" && *value == "blocked" && !r.blockers.is_empty())
+    })
+    .map(|(label, value, _)| (label, value))
+}
+
+fn checks(r: &Record, compact: bool) -> Vec<String> {
+    let c = &r.checks;
+    let mut lines: Vec<_> = target_checks(r)
+        .map(|(label, value)| check_line(label, value, compact))
+        .collect();
     for (label, value, ordinary) in [
         (
             "release withdrawal",
@@ -363,7 +686,7 @@ fn checks(r: &Record) -> Vec<String> {
         ),
     ] {
         if !ordinary.contains(&value) {
-            lines.push(format!("{label}: {}", check_text(value)));
+            lines.push(check_line(label, value, compact));
         }
     }
     match c.parent_search.as_str() {
@@ -385,34 +708,37 @@ fn checks(r: &Record) -> Vec<String> {
         c.availability_source.as_str(),
         "catalog" | "exact_metadata" | "mixed" | "not_assessed"
     ) {
-        lines.push(format!(
-            "availability source: {}",
-            check_text(&c.availability_source)
+        lines.push(check_line(
+            "availability source",
+            &c.availability_source,
+            compact,
         ));
     }
     if c.preference_differences != 0 {
-        lines.push(format!(
-            "requests with different preferences: {}",
-            c.preference_differences
-        ));
+        lines.push("Some dependency requests have different version preferences.".into());
     }
-    if c.prerelease_target
-        && !r
-            .changes
-            .iter()
-            .any(|c| c.data.prerelease_target == Some(true))
-    {
-        lines.push("action includes a prerelease target".into());
-    }
-    if c.deprecated_target
-        && !r
-            .changes
-            .iter()
-            .any(|c| c.data.deprecated_target == Some(true))
-    {
-        lines.push("action includes a deprecated target".into());
+    if !compact {
+        lines.extend(
+            action_target_warnings(r).map(|label| format!("action includes a {label} target")),
+        );
     }
     lines
+}
+
+fn action_target_warnings(r: &Record) -> impl Iterator<Item = &'static str> {
+    let prerelease = r.checks.prerelease_target
+        && !r
+            .changes
+            .iter()
+            .any(|c| c.data.prerelease_target == Some(true));
+    let deprecated = r.checks.deprecated_target
+        && !r
+            .changes
+            .iter()
+            .any(|c| c.data.deprecated_target == Some(true));
+    [("prerelease", prerelease), ("deprecated", deprecated)]
+        .into_iter()
+        .filter_map(|(label, warning)| warning.then_some(label))
 }
 
 /// Explain shared limits without changing findings or command outcome.
@@ -524,20 +850,34 @@ pub(super) fn request_requirement(name: Option<&str>, range: Option<&str>, statu
     text
 }
 
-fn supported_fix(r: &Record, planning_known: bool) -> bool {
+fn upgrade_evidence(r: &Record, planning_known: bool) -> bool {
     planning_known
         && matches!(r.outcome.as_str(), "proposed" | "partial")
         && known_checks(&r.checks)
         && !r.addressed_findings.is_empty()
         && r.checks.release_availability == "observed"
         && r.checks.advisories == "non_affecting"
-        && r.checks.requirements == "matched"
         && r.changes.iter().all(|c| c.data.strategy == "upgrade")
         && !((r.outcome == "partial" || !r.remaining_findings.is_empty())
             && (r.checks.prerelease_target
                 || r.changes
                     .iter()
                     .any(|c| c.data.prerelease_target == Some(true))))
+}
+
+fn clear_project_edit(r: &Record, constraints: &[Constraint]) -> bool {
+    let ([change], [blocker], [constraint]) =
+        (r.changes.as_slice(), r.blockers.as_slice(), constraints)
+    else {
+        return false;
+    };
+    r.outcome == "proposed"
+        && r.remaining_findings.is_empty()
+        && r.checks.requirements == "blocked"
+        && constraint.compact_edit.is_some()
+        && blocker.dependency_name.as_deref() == Some(change.data.name.as_str())
+        && file_role(&blocker.path) == Some(Role::Manifest)
+        && limitations(r, constraints).all(|(code, _)| search_only_limit(code))
 }
 
 fn known_checks(c: &Checks) -> bool {
@@ -565,13 +905,12 @@ fn known_checks(c: &Checks) -> bool {
 
 fn check_text(value: &str) -> String {
     match value {
-        "not_checked" => "not checked (project resolver/build not run)".into(),
         "not_assessed" => "not assessed".into(),
         "not_retained" => "not retained".into(),
         "preference_differs" => "preference differs".into(),
         "affected" => "still affected by known advisories".into(),
         "blocked" => "blocked by dependency requirements".into(),
-        "unchecked" => "not checked".into(),
+        "not_checked" | "unchecked" => "not checked".into(),
         "unverified" => "not verified".into(),
         "unknown" => "not determined from the supplied evidence".into(),
         "unsupported" => "advisory checking is not supported for this target".into(),
@@ -621,14 +960,5 @@ fn explanation(value: &str) -> String {
         "project_preference_change" => "applying this change requires updating the project preference".into(),
         "unresolved_manifest_activation" => "manifest applicability is unresolved".into(),
         _ => UNFAMILIAR_REASON.into(),
-    }
-}
-
-fn constraint_reason(b: &Blocker) -> String {
-    match b.reason.as_str() {
-        "third_party_request_excludes_target" | "required_request_excludes_target" => {
-            "Dependency requirements conflict with this candidate.".into()
-        }
-        _ => explanation(&b.reason),
     }
 }

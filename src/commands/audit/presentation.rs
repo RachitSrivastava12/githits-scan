@@ -46,6 +46,8 @@ struct Recommendation<'a> {
     findings: &'a [Finding],
     addressed_findings: &'a [Finding],
     remaining_findings: &'a [Finding],
+    compact_summary: String,
+    details_recommended: bool,
     #[serde(flatten)]
     explanation: Plan,
 }
@@ -65,18 +67,24 @@ impl<'a> Remediation<'a> {
             .recommendations
             .iter()
             .enumerate()
-            .map(|(index, r)| Recommendation {
-                index,
-                subject: &r.subject,
-                findings: &r.findings,
-                addressed_findings: &r.addressed_findings,
-                remaining_findings: &r.remaining_findings,
-                explanation: Plan::new(
+            .map(|(index, r)| {
+                let explanation = Plan::new(
                     r,
                     &data.status,
                     &context::Context::record(r),
                     ReasonDetail::Evidence,
-                ),
+                );
+                let (compact_summary, details_recommended) = explanation.compact(r);
+                Recommendation {
+                    index,
+                    subject: &r.subject,
+                    findings: &r.findings,
+                    addressed_findings: &r.addressed_findings,
+                    remaining_findings: &r.remaining_findings,
+                    compact_summary,
+                    details_recommended,
+                    explanation,
+                }
             })
             .collect();
         result

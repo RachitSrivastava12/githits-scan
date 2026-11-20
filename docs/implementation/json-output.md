@@ -198,6 +198,8 @@ report. It contains:
 | `recommendation_index` | Zero-based position in this document's `audit.remediation.recommendations` |
 | `subject` | Existing subject coordinate; never a new opaque plan ID |
 | `findings`, `addressed_findings`, `remaining_findings` | Existing `{package, advisory, files}` fact identities, unchanged |
+| `compact_summary` | Nonempty single-line plain text for this alternative. Added after Scan 0.6.0 within schema 1 |
+| `details_recommended` | Boolean presentation cue to link to this alternative's full blocks when a reader needs more context |
 | `heading` | Shared qualified heading for joint changes; null for a single change whose summary carries its qualification, or when no changes were supplied |
 | `outcome` | Plain-language separate outcome, or null when the heading suffices |
 | `changes` | Ordered changes that belong together within this alternative |
@@ -211,10 +213,10 @@ report. It contains:
 Each change has `change_index` (zero-based within the matching fact record),
 `summary`, `details`, `files` and `reasons`. Each reason has `summary` and
 `evidence` (supporting request explanations). Detailed reason evidence is always
-exported when available; native compact output can suppress redundant advisory
-reasons and request inventories. All explanation selection and wording still come
-from the same model. Missing or unfamiliar reason detail is qualified explicitly
-in the detailed export; it never becomes an invented checked benefit.
+exported when available. Ordinary native output can suppress redundant advisory
+reasons and supporting request inventories. Use the full blocks alongside
+compact text for change reasons and their supporting evidence. Missing or
+unfamiliar reason detail is qualified explicitly in the detailed export.
 
 Indices are document-local links, stable only within this complete report. They
 are not backend identifiers or identities across analyses. Coordinates, advisory
@@ -226,17 +228,45 @@ different advisory context; the same builder adjusts redundant impact and file
 wording to that context. A consumer may use the fact identities to link to advisory
 metadata in `audit.vulnerabilities`.
 
-For a table, show a supplied `heading` together with every `changes[].summary`.
-For a single change, its summary carries the supported/candidate and partial
-qualification; there is no extra heading to repeat.
-Place checked reasons, `impact`, constraints, limitations and search explanations in the same row or its
-associated details. A project requirement by itself is context for applying a
-change, not a substitute for the candidate's changed package/version. Keep joint
-changes together, and keep alternative records separate. A removed route does not
-prove every advisory occurrence closes. `Suggested fix` describes the supplied
-checks, not successful native installation or a verified build. Partial/unresolved
-prerelease proposals remain candidates even if some findings are addressed;
-complete supported proposals retain their explicit prerelease warning.
+Use `compact_summary` directly beside the finding identities that associate the
+alternative with the row. It names the exact changes and the advisories a
+supported upgrade addresses, even when the row covers more advisories than this
+alternative. Joint changes share one summary. Keep independent alternatives
+separate. The summary leads with the version changes and target warnings,
+then highlights the main issue affecting the proposed change. Concrete
+dependency conflicts take priority. A release or requirement check gap can
+explain why a proposed change is uncertain. If the report only lacks an
+application method, the summary states that gap directly.
+`Bump` uses the same qualification as a supported upgrade in native output.
+When that upgrade supplies a shared path that Scan recognizes as a lockfile,
+the summary names it even if the detailed blocks omit it as repeated context.
+This describes the recorded scope of the upgrade.
+Proposals with remaining advisories name them so readers can see the limits of
+applying the change. The detailed impact block retains any reported potential
+benefit for a candidate. Target warnings stay with their respective versions.
+A record without a change explains the outcome and includes a reported obstacle
+when available.
+
+Use `details_recommended` to decide whether to show a link such as **Details**
+beside the summary. Scan sets it for unclear candidates, no-change outcomes
+and upgrades with qualifications such as open advisories, target warnings or
+coordination issues. A routine supported upgrade and a single named project
+constraint edit with a recorded current range and otherwise supported upgrade
+evidence have it set to false. A clear edit names the advisories the upgrade
+addresses after the edit. The flag is presentation guidance.
+Limits confined to searching for other alternatives stay in the full blocks
+and leave a supported upgrade's flag false.
+Continue to use audit facts and the exit code for policy. The consumer owns
+the link and its target.
+
+Use the full blocks for supporting requests, checked-effect evidence and detailed
+upgrade searches. Display report-wide `messages` and `limits` once with the
+guidance. Scan provides a single line without a fixed byte budget. Consumers own
+layout, escaping and links, including where to put longer qualified alternatives
+when space is limited. Keep the qualifications with the proposed changes.
+For schema-1 output from Scan 0.6.0, feature-detect the absent fields and use the
+full explanation blocks if supporting that release. Existing saved analyses
+produce the field when replayed with a binary that supports it.
 
 When planning is absent with vulnerabilities, `messages` says guidance is
 unavailable; absent planning without vulnerabilities has empty arrays. Unverified
@@ -250,7 +280,7 @@ arrays mean no additional blocks to display, not an all-clear determination.
 
 ### Plain text and consumer responsibilities
 
-Explanation strings contain no ANSI styling, HTML or Markdown. Scan escapes
+Scan produces plain text without adding ANSI styling, HTML or Markdown. It escapes
 control characters for display (for example a newline becomes the literal `\n`)
 and preserves ordinary punctuation such as `<`, `&`, pipes and backticks. JSON
 encoding remains normal JSON escaping; decode it once. Fact values and path arrays
@@ -259,7 +289,7 @@ values for their own output context: Markdown tables, GitHub HTML, URLs, shell
 commands or terminal output. Do not parse terminal output, split prose into
 meaning, or turn these strings into executable commands.
 
-After adoption, a consumer such as scan-action can remove its duplicate candidate
+After adoption, a consumer can remove its duplicate candidate
 qualification, blocker/reason phrase mapping, compact plan semantic selection,
 partial-impact wording and explanation-meaning tests. Scan owns those cases.
 Retain consumer tests for schema support, associations, missing evidence, inclusion

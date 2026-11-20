@@ -96,7 +96,7 @@ fn partial_parent_keeps_candidate_identity_checked_benefit_and_unresolved_impact
     );
     assert_eq!(
         plan.constraints[0].summary,
-        "Update the example-parent requirement in Cargo.toml. Current requirement: ^2.0."
+        "Applying the candidate requires updating the example-parent requirement in Cargo.toml. Current requirement: ^2.0."
     );
     assert!(
         plan.context.is_empty(),
@@ -106,6 +106,13 @@ fn partial_parent_keeps_candidate_identity_checked_benefit_and_unresolved_impact
     audit::render::write(&view, false, &mut text, crate::style::Palette::PLAIN).expect("text");
     let text = String::from_utf8(text).expect("utf8");
     let document = serde_json::to_value(Document::new(&view)).expect("presentation");
+    assert_eq!(
+        document["remediation"]["recommendations"][0]["compact_summary"],
+        concat!(
+            "cargo:example-parent 2.0.0 -> 2.1.0. Still open: GHSA-example. ",
+            "Applying the proposal requires updating the version constraint for example-parent in Cargo.toml (currently ^2.0)."
+        )
+    );
     // Layout/serialization consume the computed blocks without a second phrase map.
     for value in [
         &plan.changes[0].summary,
@@ -240,8 +247,165 @@ fn prerelease_qualification_checks_both_flags_and_preserves_complete_proposals()
                     .chain(&plan.changes[0].details)
                     .any(|s| s.contains("prerelease"))
             );
+            let compact = compact_summary(&input);
+            assert_eq!(compact.starts_with("Bump "), supported);
+            assert_eq!(
+                compact.contains("Addresses GHSA-demo"),
+                supported,
+                "{compact}"
+            );
+            assert!(!compact.contains("Could address"), "{compact}");
+            assert!(compact.contains("prerelease"));
+            assert_eq!(compact.contains("Still open:"), !supported);
         }
     }
+}
+
+fn compact_summary(input: &Value) -> String {
+    let view = project(input);
+    serde_json::to_value(Document::new(&view)).expect("presentation")["remediation"]
+        ["recommendations"][0]["compact_summary"]
+        .as_str()
+        .expect("compact text")
+        .to_owned()
+}
+
+#[test]
+fn compact_summary_preserves_partial_benefit_and_unverified_application() {
+    let mut input = input();
+    let r = &mut input["remediation"]["recommendations"][0];
+    r["outcome"] = "partial".into();
+    r["remaining_finding_refs"] = json!([0]);
+    r["addressed_finding_refs"] = json!([]);
+    r["changes"][0]["strategy"] = "unknown".into();
+    r["changes"][0]["target_version"] = "1.2.0-rc.1".into();
+    r["changes"][0]["prerelease_target"] = true.into();
+    r["checks"]["requirements"] = "unchecked".into();
+    r["checks"]["release_availability"] = "unverified".into();
+    assert_eq!(
+        compact_summary(&input),
+        concat!(
+            "npm:demo 1.0.0 -> 1.2.0-rc.1 (prerelease). Still open: GHSA-demo. ",
+            "Target release availability unverified."
+        )
+    );
+    let view = project(&input);
+    let doc = serde_json::to_value(Document::new(&view)).expect("presentation");
+    let recommendation = &doc["remediation"]["recommendations"][0];
+    assert_eq!(recommendation["details_recommended"], true);
+    assert_eq!(
+        recommendation["checks"],
+        json!([
+            "release availability: not verified",
+            "requirements: not checked"
+        ])
+    );
+    assert_eq!(
+        recommendation["impact"],
+        json!([
+            "would address: none reported",
+            "still unresolved: GHSA-demo"
+        ])
+    );
+    let checks = &mut input["remediation"]["recommendations"][0]["checks"];
+    checks["release_availability"] = "observed".into();
+    checks["requirements"] = "matched".into();
+    assert!(
+        compact_summary(&input)
+            .ends_with("The report does not specify how to update this dependency.")
+    );
+    input["remediation"]["recommendations"][0]["changes"][0]["strategy"] = "future_strategy".into();
+    assert!(
+        compact_summary(&input)
+            .ends_with("Scan does not recognize the update method for this dependency.")
+    );
+}
+
+#[test]
+fn compact_summary_attributes_an_unfamiliar_joint_update_method() {
+    let mut input: Value = serde_json::from_slice(include_bytes!(
+        "../../../../tests/fixtures/audit/graph.json"
+    ))
+    .expect("joint report");
+    input["remediation"]["recommendations"][0]["changes"][1]["strategy"] = "future_strategy".into();
+    let summary = compact_summary(&input);
+    assert!(
+        summary.ends_with("Scan does not recognize the update method for npm:parent."),
+        "{summary}"
+    );
+}
+
+#[test]
+fn compact_summary_groups_joint_changes_with_attributable_warnings_and_coordination() {
+    let mut input: Value = serde_json::from_slice(include_bytes!(
+        "../../../../tests/fixtures/audit/graph.json"
+    ))
+    .expect("joint report");
+    let r = &mut input["remediation"]["recommendations"][0];
+    r["changes"][0]["prerelease_target"] = true.into();
+    r["changes"][0]["target_version"] = "1.1.1-rc.1".into();
+    r["limitations"] = json!([
+        "checked_occurrence_changed_by_other_recommendation",
+        "incompatible_recommendations"
+    ]);
+    assert_eq!(
+        compact_summary(&input),
+        concat!(
+            "Bump npm:demo 1.0.0 -> 1.1.1-rc.1 (prerelease) and ",
+            "npm:parent 2.0.0 -> 2.1.0 (deprecated) together in package-lock.json. ",
+            "Addresses GHSA-example. ",
+            "Do not combine conflicting recommendations."
+        )
+    );
+    input["remediation"]["recommendations"][0]["checks"]["release_availability"] =
+        "unverified".into();
+    let summary = compact_summary(&input);
+    assert!(summary.ends_with("Do not combine conflicting recommendations."));
+    assert!(
+        !summary.contains("Target release availability"),
+        "{summary}"
+    );
+}
+
+#[test]
+fn compact_summary_names_conflicting_requests_in_a_joint_candidate() {
+    let mut input: Value = serde_json::from_slice(include_bytes!(
+        "../../../../tests/fixtures/audit/graph.json"
+    ))
+    .expect("joint report");
+    let r = &mut input["remediation"]["recommendations"][0];
+    let mut constraint = blocker();
+    constraint["dependency_name"] = "demo".into();
+    constraint["requested_requirement"] = "~1.0".into();
+    r["blockers"] = json!([constraint]);
+    r["checks"]["requirements"] = "blocked".into();
+    r["checks"]["release_availability"] = "unverified".into();
+    assert_eq!(
+        compact_summary(&input),
+        concat!(
+            "npm:demo 1.0.0 -> 1.1.1 and npm:parent 2.0.0 -> 2.1.0 (deprecated) together. ",
+            "Upgrade conflict on a requirement ",
+            "(express@5.1.0 requires demo ~1.0 [package-lock.json])."
+        )
+    );
+    let r = &mut input["remediation"]["recommendations"][0];
+    let mut second = r["blockers"][0].clone();
+    second["owner"]["name"] = "other".into();
+    second["requested_requirement"] = ">=1, <1.1".into();
+    r["blockers"].as_array_mut().expect("requests").push(second);
+    r["changes"][1]["conflicting_target_versions"] = json!(["2.2.0", "2.3.0"]);
+    r["changes"][1]["strategy"] = "override".into();
+    let summary = compact_summary(&input);
+    assert!(summary.contains(
+        "npm:parent 2.0.0 -> 2.1.0 (conflicts with 2.2.0 and 2.3.0, deprecated, override proposal)"
+    ));
+    assert!(
+        summary.contains(concat!(
+            "Upgrade conflict on requirements (express@5.1.0 requires demo ~1.0 [package-lock.json]) ",
+            "and (other@5.1.0 requires demo >=1, <1.1 [package-lock.json])."
+        )),
+        "{summary}"
+    );
 }
 
 #[test]
@@ -308,7 +472,8 @@ fn outcomes_without_changes_explain_what_was_not_established() {
         let r = &mut input["remediation"]["recommendations"][0];
         r["outcome"] = outcome.into();
         r["changes"] = json!([]);
-        let plan = plan(&project(&input));
+        let view = project(&input);
+        let plan = plan(&view);
         assert!(plan.heading.is_none());
         let text = plan.outcome.expect("explanation");
         assert_ne!(text, outcome);
@@ -320,6 +485,7 @@ fn outcomes_without_changes_explain_what_was_not_established() {
             }),
             "{text}"
         );
+        assert!(compact_summary(&input).starts_with(&text));
     }
 }
 
@@ -360,6 +526,13 @@ fn indeterminate_checks_are_retained_without_claiming_no_reason_was_supplied() {
             !plan.checks.is_empty(),
             "{field} must have a visible qualification"
         );
+        if field == "preference_differences" {
+            assert_eq!(
+                plan.checks,
+                ["Some dependency requests have different version preferences."]
+            );
+            assert!(compact_summary(&input).contains(&plan.checks[0]));
+        }
         assert_eq!(
             plan.outcome.as_deref(),
             Some("The service could not determine a mitigation.")

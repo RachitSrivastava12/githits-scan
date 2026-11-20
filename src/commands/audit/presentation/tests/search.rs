@@ -40,8 +40,38 @@ fn audit_search_explains_losing_release_without_changing_selected_fix() {
         blocks(&input())["remediation"]["recommendations"][0]["changes"][0]["summary"]
     );
     assert_eq!(
+        r["compact_summary"],
+        blocks(&input())["remediation"]["recommendations"][0]["compact_summary"]
+    );
+    assert_eq!(r["details_recommended"], false);
+    assert_eq!(
         doc["audit"]["remediation"]["recommendations"][0]["search_details"][0]["witness"]["coordinate"],
         coordinate("example-parent", "3.0.0")
+    );
+}
+
+#[test]
+fn audit_search_limits_for_other_candidates_do_not_qualify_a_supported_bump() {
+    let mut value = with_search("retained", json!([]));
+    let r = &mut value["remediation"]["recommendations"][0];
+    r["checks"]["parent_search"] = "limited".into();
+    r["limitations"] = json!(["parent_candidate_limit"]);
+    let doc = blocks(&value);
+    let r = &doc["remediation"]["recommendations"][0];
+    assert_eq!(
+        r["compact_summary"],
+        "Bump npm:demo 1.0.0 -> 1.1.1 in package-lock.json. Addresses GHSA-demo."
+    );
+    assert_eq!(r["details_recommended"], false);
+    assert_eq!(
+        r["checks"],
+        json!(["Upgrades to packages using this dependency were not fully checked."])
+    );
+    assert!(
+        r["limitations"][0]
+            .as_str()
+            .expect("limit")
+            .contains("limit for checking")
     );
 }
 
@@ -101,8 +131,7 @@ fn audit_search_keeps_selected_limit_when_losing_alternative_shares_reason() {
     );
 }
 
-#[test]
-fn audit_search_copy_keeps_single_candidate_partial_and_required_edit_clear() {
+fn input_with_project_edit() -> Value {
     let mut value = input();
     let mut edit = blocker();
     edit["owner_role"] = "project".into();
@@ -113,6 +142,12 @@ fn audit_search_copy_keeps_single_candidate_partial_and_required_edit_clear() {
     let r = &mut value["remediation"]["recommendations"][0];
     r["blockers"] = json!([edit]);
     r["checks"]["requirements"] = "blocked".into();
+    value
+}
+
+#[test]
+fn audit_search_copy_keeps_single_candidate_partial_and_required_edit_clear() {
+    let mut value = input_with_project_edit();
     let doc = blocks(&value);
     let r = &doc["remediation"]["recommendations"][0];
     assert!(r["heading"].is_null());
@@ -124,13 +159,22 @@ fn audit_search_copy_keeps_single_candidate_partial_and_required_edit_clear() {
     );
     assert_eq!(
         r["constraints"][0]["summary"],
-        "Update the demo requirement in package.json. Current requirement: ^1.0."
+        "Applying the candidate requires updating the demo requirement in package.json. Current requirement: ^1.0."
     );
-    assert_eq!(r["impact"], json!([]));
+    assert_eq!(r["impact"], json!(["would address the listed advisory"]));
+    assert_eq!(r["details_recommended"], false);
+    assert_eq!(
+        r["compact_summary"],
+        concat!(
+            "npm:demo 1.0.0 -> 1.1.1. ",
+            "Update version constraint for demo in package.json (currently ^1.0). Addresses GHSA-demo."
+        )
+    );
     value["remediation"]["recommendations"][0]["outcome"] = "partial".into();
     value["remediation"]["recommendations"][0]["remaining_finding_refs"] = json!([0]);
     let doc = blocks(&value);
     let r = &doc["remediation"]["recommendations"][0];
+    assert_eq!(r["details_recommended"], true);
     assert!(
         r["changes"][0]["summary"]
             .as_str()
@@ -141,6 +185,24 @@ fn audit_search_copy_keeps_single_candidate_partial_and_required_edit_clear() {
         serde_json::to_string(&r["impact"])
             .expect("impact")
             .contains("still unresolved")
+    );
+}
+
+#[test]
+fn audit_search_unverified_target_takes_priority_over_project_edit() {
+    let mut value = input_with_project_edit();
+    value["remediation"]["recommendations"][0]["checks"]["release_availability"] =
+        "unverified".into();
+    let doc = blocks(&value);
+    let r = &doc["remediation"]["recommendations"][0];
+    assert_eq!(
+        r["compact_summary"],
+        "npm:demo 1.0.0 -> 1.1.1. Target release availability unverified."
+    );
+    assert_eq!(r["details_recommended"], true);
+    assert_eq!(
+        r["constraints"][0]["summary"],
+        "Applying the candidate requires updating the demo requirement in package.json. Current requirement: ^1.0."
     );
 }
 
@@ -357,6 +419,8 @@ fn audit_search_indeterminate_result_does_not_deny_supplied_search_evidence() {
     );
     let r = &mut value["remediation"]["recommendations"][0];
     r["outcome"] = "indeterminate".into();
+    r["addressed_finding_refs"] = json!([]);
+    r["remaining_finding_refs"] = json!([0]);
     r["changes"] = json!([]);
     r["blockers"] = json!([]);
     r["limitations"] = json!([]);
@@ -366,6 +430,14 @@ fn audit_search_indeterminate_result_does_not_deny_supplied_search_evidence() {
     assert_eq!(
         r["outcome"],
         "The service could not determine a mitigation."
+    );
+    assert_eq!(r["details_recommended"], true);
+    assert_eq!(
+        r["compact_summary"],
+        concat!(
+            "The service could not determine a mitigation. ",
+            "Release metadata for cargo:example-parent@3.0.0: lookup failed."
+        )
     );
     assert_eq!(
         r["search_explanations"]
