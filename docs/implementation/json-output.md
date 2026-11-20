@@ -246,6 +246,11 @@ applying the change. The detailed impact block retains any reported potential
 benefit for a candidate. Target warnings stay with their respective versions.
 A record without a change explains the outcome and includes a reported obstacle
 when available.
+When the selected change includes checked additions, the summary can name one
+registry-selected root and points to the full dependency checks through
+`details_recommended`. A candidate with no applicable change can surface a
+specific addition problem, such as an affecting advisory or the exact release
+whose dependencies could not be checked.
 
 Use `details_recommended` to decide whether to show a link such as **Details**
 beside the summary. Scan sets it for unclear candidates, no-change outcomes
@@ -344,8 +349,9 @@ collection was omitted. An unfamiliar retention status remains explicit.
 Optional `remediation.limits.omitted_search_details` counts omitted entries across
 recommendations, including omitted recommendations and losing alternatives.
 
-Known detail kinds are `unavailable` (operation, nonempty reasons, witness) and
-`stopped` (stage, reason, witness). Stopped details require a nullable coordinate
+Known detail kinds are `unavailable` (operation, nonempty reasons, witness),
+`stopped` (stage, reason, witness), and `added_dependency` (candidate and source
+witness, branch evidence). Stopped details require a nullable coordinate
 slot and budget scope; `used` and positive `allowed` occur together when supplied.
 Known local/shared budget scope stays in fact JSON without a routine human note.
 Counts retain producer units in fact JSON; human explanations do not guess units
@@ -368,6 +374,26 @@ Search details can describe losing alternatives. They never alter selected-actio
 checks, candidate qualification, policy, incompleteness or exit codes. Equal reason
 codes do not establish equal scope: a search detail cannot suppress a selected-plan
 limitation. Captured conditions are literal evidence, never inferred activation.
+
+### Added-dependency branch evidence
+
+When supplied, `remediation.recommendations[].changes[].added_dependencies`
+is an array of checked branches attached to the change that introduced the
+requests. A whole-search detail of kind `added_dependency` carries the same
+branch object in `added_dependency` and retains the candidate coordinate and
+source in its `witness`. Older reports can omit both forms.
+
+Each branch keeps the registry and canonical name, authored name and requirement
+with its capture status, dependency scope, selection basis and nullable selected
+version. The `coordinates` array retains advisory status and IDs for each exact
+selected version. The `issues` array retains the operation, reason and supplied
+evidence, including failed coordinates or requests, HTTP status, conflicting
+requirements and versions, and Cargo feature or Python extra activation inputs.
+Scan preserves these facts in schema-2 output and saved analysis. Presentation
+JSON supplies the same readable explanations as native audit output in the owning
+change's `details` and the matching `search_explanations` entry.
+`registry_resolution` describes the supplied registry branch. The project
+installer may select different copies or apply different policy.
 Authored dependency names remain separate from requesting owners and canonical targets.
 Search explanations are computed by the shared presentation owner, without another
 backend job. A missing/uninterpretable reason is stated explicitly rather than

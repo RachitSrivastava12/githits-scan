@@ -34,6 +34,17 @@ pub(super) fn explain(record: &Record) -> Vec<Explanation> {
         .map(|(index, detail)| explanation(index, detail))
         .collect()
 }
+
+pub(super) fn compact_obstacle(record: &Record, explanations: &[Explanation]) -> Option<String> {
+    explanations
+        .iter()
+        .zip(record.search_details.iter().flatten())
+        .find_map(|(explanation, detail)| match detail {
+            Detail::AddedDependency(detail) => super::added::compact_search(detail),
+            _ => Some(explanation.summary.clone()),
+        })
+}
+
 fn explanation(index: usize, detail: &Detail) -> Explanation {
     let (summary, details) = match detail {
         Detail::Unavailable(d) => (
@@ -44,6 +55,7 @@ fn explanation(index: usize, detail: &Detail) -> Explanation {
             stopped(&d.stage, &d.reason, &d.witness),
             context(&d.witness, subject(&d.witness, None)),
         ),
+        Detail::AddedDependency(d) => super::added::search(d),
         Detail::Unrecognized { .. } => (
             "Scan cannot interpret this search detail; its kind is not supported by this version."
                 .into(),
@@ -205,7 +217,7 @@ fn cause(value: &str) -> &'static str {
 fn incomplete_cause(value: &str) -> &'static str {
     known_cause(value).unwrap_or("the check could not be completed; Scan cannot explain the supplied reason; see JSON for the original value")
 }
-fn known_cause(value: &str) -> Option<&'static str> {
+pub(super) fn known_cause(value: &str) -> Option<&'static str> {
     if let Some(reason) = crate::commands::evidence::reason(value) {
         return Some(reason);
     }
