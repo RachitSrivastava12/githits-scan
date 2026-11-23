@@ -8,29 +8,70 @@ use crate::api::audit::remediation::{
 };
 
 pub(super) fn change_lines(branches: &[Branch]) -> impl Iterator<Item = String> + '_ {
-    branches
-        .iter()
-        .flat_map(|branch| {
-            let request = request(branch);
-            std::iter::once(format!("This release {request} as a new dependency."))
-                .chain(lines(branch))
-        })
-        .chain(installer_note(branches))
+    branches.iter().flat_map(|branch| {
+        let request = request(branch);
+        std::iter::once(format!("This release {request} as a new dependency.")).chain(lines(branch))
+    })
+}
+
+pub(super) enum CompactAddition {
+    Advisory(String),
+    Problem(String),
+    Description(String),
+}
+
+impl CompactAddition {
+    pub(super) const fn is_problem(&self) -> bool {
+        matches!(self, Self::Advisory(_) | Self::Problem(_))
+    }
 }
 
 pub(super) fn compact_changes<'a>(
-    mut branches: impl Iterator<Item = &'a Branch>,
-) -> Option<String> {
-    let first = branches.next()?;
-    let (true, Some(version)) = (registry_resolution(first), &first.selected_version) else {
-        return Some("The report includes checks for new dependency requests".into());
-    };
-    let intro = if branches.next().is_some() {
-        "One new dependency selected by registry checks is"
+    branches: impl Iterator<Item = &'a Branch>,
+) -> Option<CompactAddition> {
+    let mut count = 0;
+    let (branch, problem) = branches
+        .inspect(|_| count += 1)
+        .map(|branch| (branch, search_problem(branch)))
+        .min_by_key(|(_, problem)| match problem {
+            Some(SearchProblem::Affected(_)) => 0,
+            Some(_) => 1,
+            None => 2,
+        })?;
+    if let Some(SearchProblem::Affected(checked)) = &problem
+        && registry_resolution(branch)
+    {
+        let coordinate = safe(&checked.coordinate.to_string());
+        let advisory = if checked.advisory_ids.is_empty() {
+            "with an advisory the report did not identify".into()
+        } else {
+            format!("affected by {}", list(&checked.advisory_ids))
+        };
+        return Some(CompactAddition::Advisory(format!(
+            "a new dependency, {coordinate}, {advisory}"
+        )));
+    }
+    let scope = if count == 1 {
+        "a new dependency".into()
     } else {
-        "Adds new dependency"
+        format!("one of {count} new dependency requests")
     };
-    Some(format!("{intro} {}@{}", package(first), safe(version)))
+    let summary =
+        if let (true, Some(version)) = (registry_resolution(branch), &branch.selected_version) {
+            format!(
+                "Registry checks selected {}@{} for {scope}",
+                package(branch),
+                safe(version)
+            )
+        } else {
+            format!("The release {} as {scope}", request(branch))
+        };
+    Some(match problem {
+        Some(problem) => {
+            CompactAddition::Problem(format!("{summary}. {}", problem.explain(branch)))
+        }
+        None => CompactAddition::Description(summary),
+    })
 }
 
 pub(super) fn search(detail: &AddedDependency) -> (String, Vec<String>) {
@@ -48,20 +89,12 @@ pub(super) fn search(detail: &AddedDependency) -> (String, Vec<String>) {
         None => "",
     };
     let summary = format!("{candidate} [{path}] {request} as a new dependency.{result}");
-    let details = lines(&detail.branch)
-        .chain(installer_note(std::slice::from_ref(&detail.branch)))
-        .collect();
-    (summary, details)
+    (summary, lines(&detail.branch).collect())
 }
 
 pub(super) fn compact_search(detail: &AddedDependency) -> Option<String> {
     let branch = &detail.branch;
-    let obstacle = match search_problem(branch)? {
-        SearchProblem::Affected(checked) | SearchProblem::Unchecked(checked) => {
-            advisory_check(checked)
-        }
-        SearchProblem::Issue(issue) => issue_summary(issue, branch),
-    };
+    let obstacle = search_problem(branch)?.explain(branch);
     Some(format!(
         "{} {} as a new dependency. {obstacle}",
         candidate(detail),
@@ -80,6 +113,15 @@ enum SearchProblem<'a> {
     Affected(&'a CheckedCoordinate),
     Issue(&'a Issue),
     Unchecked(&'a CheckedCoordinate),
+}
+
+impl SearchProblem<'_> {
+    fn explain(&self, branch: &Branch) -> String {
+        match self {
+            Self::Affected(checked) | Self::Unchecked(checked) => advisory_check(checked),
+            Self::Issue(issue) => issue_summary(issue, branch),
+        }
+    }
 }
 
 fn search_problem(branch: &Branch) -> Option<SearchProblem<'_>> {
@@ -117,10 +159,12 @@ fn registry_resolution(branch: &Branch) -> bool {
     branch.selection_basis == "registry_resolution"
 }
 
-fn installer_note(branches: &[Branch]) -> Option<String> {
-    branches.iter().any(registry_resolution).then(|| {
-        "The project installer may select different package copies or apply different policy than these registry checks.".into()
-    })
+pub(super) fn installer_note(branches: &[Branch], pending: &mut bool) -> Option<String> {
+    if !*pending || !branches.iter().any(registry_resolution) {
+        return None;
+    }
+    *pending = false;
+    Some("The project installer may select different package copies or apply different policy than these registry checks.".into())
 }
 
 fn selection(branch: &Branch) -> String {

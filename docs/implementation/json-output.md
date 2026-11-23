@@ -237,7 +237,9 @@ then highlights the main issue affecting the proposed change. Concrete
 dependency conflicts take priority. A release or requirement check gap can
 explain why a proposed change is uncertain. If the report only lacks an
 application method, the summary states that gap directly.
-`Bump` uses the same qualification as a supported upgrade in native output.
+`Bump` requires the same evidence as a supported native upgrade. If the
+report also shows a problem with an added dependency, the summary states the
+proposed versions and the problem without an instruction to upgrade.
 When that upgrade supplies a shared path that Scan recognizes as a lockfile,
 the summary names it even if the detailed blocks omit it as repeated context.
 This describes the recorded scope of the upgrade.
@@ -246,19 +248,25 @@ applying the change. The detailed impact block retains any reported potential
 benefit for a candidate. Target warnings stay with their respective versions.
 A record without a change explains the outcome and includes a reported obstacle
 when available.
-When the selected change includes checked additions, the summary can name one
-registry-selected root and points to the full dependency checks through
-`details_recommended`. A candidate with no applicable change can surface a
-specific addition problem, such as an affecting advisory or the exact release
-whose dependencies could not be checked.
+The summary keeps confirmed target advisories and concrete requirement
+conflicts visible alongside any reported problem with a new dependency. For
+that dependency, it names the affected version and supplied advisory IDs or
+explains the specific failed or incomplete check. Confirmed warnings and
+recorded blockers take priority over general check gaps. The full checks show
+confirmed target warnings first, then explain what remains unverified and
+say when a check supplies no reason. Related limitations and search
+explanations keep the scope reported by the service.
+A candidate with no applicable change can also name a specific problem with a
+new dependency request. The `details_recommended` cue points to the full checks.
 
 Use `details_recommended` to decide whether to show a link such as **Details**
 beside the summary. Scan sets it for unclear candidates, no-change outcomes
 and upgrades with qualifications such as open advisories, target warnings or
-coordination issues. A routine supported upgrade and a single named project
-constraint edit with a recorded current range and otherwise supported upgrade
-evidence have it set to false. A clear edit names the advisories the upgrade
-addresses after the edit. The flag is presentation guidance.
+coordination issues. A change with checked additions also recommends Details,
+including when those checks report no problem. Without these qualifications,
+a routine supported upgrade or a single named project constraint edit with a
+recorded current range has it set to false. A clear edit names the advisories
+the upgrade addresses after the edit. The flag is presentation guidance.
 Limits confined to searching for other alternatives stay in the full blocks
 and leave a supported upgrade's flag false.
 Continue to use audit facts and the exit code for policy. The consumer owns
@@ -392,8 +400,11 @@ requirements and versions, and Cargo feature or Python extra activation inputs.
 Scan preserves these facts in schema-2 output and saved analysis. Presentation
 JSON supplies the same readable explanations as native audit output in the owning
 change's `details` and the matching `search_explanations` entry.
-`registry_resolution` describes the supplied registry branch. The project
-installer may select different copies or apply different policy.
+`registry_resolution` describes the supplied registry branch. The first such
+branch in the recommendation's full blocks explains that the project installer
+may select different copies or apply different policy. Display those blocks
+together or use each branch's `selection_basis` to qualify independently
+displayed evidence.
 Authored dependency names remain separate from requesting owners and canonical targets.
 Search explanations are computed by the shared presentation owner, without another
 backend job. A missing/uninterpretable reason is stated explicitly rather than

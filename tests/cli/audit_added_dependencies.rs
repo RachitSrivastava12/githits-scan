@@ -74,7 +74,7 @@ fn audit_added_dependencies_keeps_checked_branch_and_losing_candidates() {
         presentation["compact_summary"],
         concat!(
             "Bump npm:demo 1.0.0 -> 1.1.1 in package-lock.json. Addresses GHSA-demo. ",
-            "Adds new dependency npm:added-child@1.0.0."
+            "Registry checks selected npm:added-child@1.0.0 for a new dependency."
         )
     );
     let change = &presentation["changes"][0];
@@ -86,6 +86,12 @@ fn audit_added_dependencies_keeps_checked_branch_and_losing_candidates() {
         "No affecting advisories found for npm:added-child@1.0.0, npm:optional-descendant@1.0.0."
     ));
     let searches = &presentation["search_explanations"];
+    assert!(details.contains("The project installer may select different package copies"));
+    assert!(
+        !searches
+            .to_string()
+            .contains("The project installer may select")
+    );
     assert_eq!(searches[0]["search_detail_index"], 0);
     assert_eq!(searches[1]["search_detail_index"], 1);
     assert_eq!(searches[2]["search_detail_index"], 2);
@@ -141,6 +147,10 @@ fn assert_native(output: &str) {
     assert!(
         search.contains("Candidate npm:demo@1.2.0 [package-lock.json]"),
         "{output}"
+    );
+    assert_eq!(
+        output.matches("The project installer may select").count(),
+        1
     );
     assert!(search.contains("npm:affected-descendant@1.0.0 found applicable advisories (AUDIT-ADDED-affected-descendant)"), "{output}");
     assert!(

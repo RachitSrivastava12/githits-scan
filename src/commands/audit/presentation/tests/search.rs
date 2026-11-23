@@ -189,7 +189,7 @@ fn audit_search_copy_keeps_single_candidate_partial_and_required_edit_clear() {
 }
 
 #[test]
-fn audit_search_unverified_target_takes_priority_over_project_edit() {
+fn audit_search_keeps_concrete_project_edit_ahead_of_unverified_target() {
     let mut value = input_with_project_edit();
     value["remediation"]["recommendations"][0]["checks"]["release_availability"] =
         "unverified".into();
@@ -197,7 +197,7 @@ fn audit_search_unverified_target_takes_priority_over_project_edit() {
     let r = &doc["remediation"]["recommendations"][0];
     assert_eq!(
         r["compact_summary"],
-        "npm:demo 1.0.0 -> 1.1.1. Target release availability unverified."
+        "npm:demo 1.0.0 -> 1.1.1. Applying the proposal requires updating the version constraint for demo in package.json (currently ^1.0)."
     );
     assert_eq!(r["details_recommended"], true);
     assert_eq!(
@@ -215,6 +215,55 @@ fn addition_evidence() -> Value {
 }
 
 #[test]
+fn audit_search_keeps_reported_blockers_ahead_of_unverified_target() {
+    for (requirements, reason, explanation) in [
+        (
+            "blocked",
+            "manifest_lock_disagreement",
+            "Manifest and lockfile disagree",
+        ),
+        (
+            "unchecked",
+            "manifest_lock_disagreement",
+            "Manifest and lockfile disagree",
+        ),
+        (
+            "blocked",
+            "project_request_change",
+            "Applying this change requires updating the project requirement",
+        ),
+    ] {
+        let mut value = input_with_project_edit();
+        let r = &mut value["remediation"]["recommendations"][0];
+        r["checks"]["requirements"] = requirements.into();
+        r["checks"]["release_availability"] = "unverified".into();
+        r["blockers"][0]["reason"] = reason.into();
+        r["blockers"][0]["requirement_status"] = "not_recorded".into();
+        r["blockers"][0]["requested_requirement"] = Value::Null;
+        let doc = blocks(&value);
+        let r = &doc["remediation"]["recommendations"][0];
+        let summary = r["compact_summary"].as_str().expect("summary");
+        assert!(
+            summary.starts_with(&format!("npm:demo 1.0.0 -> 1.1.1. {explanation}")),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("demo") && summary.contains("package.json"),
+            "{summary}"
+        );
+        assert!(
+            !summary.contains("proposed versions are available"),
+            "{summary}"
+        );
+        assert_eq!(r["details_recommended"], true);
+        assert_eq!(
+            r["checks"][0],
+            "The report did not confirm that the proposed versions are available. The release check gives no reason for the missing confirmation."
+        );
+    }
+}
+
+#[test]
 fn audit_added_dependencies_compact_preserves_clear_edit() {
     let mut value = input_with_project_edit();
     value["remediation"]["recommendations"][0]["changes"][0]["added_dependencies"] =
@@ -227,7 +276,184 @@ fn audit_added_dependencies_compact_preserves_clear_edit() {
         concat!(
             "npm:demo 1.0.0 -> 1.1.1. ",
             "Update version constraint for demo in package.json (currently ^1.0). Addresses GHSA-demo. ",
-            "Adds new dependency npm:added-child@1.0.0."
+            "Registry checks selected npm:added-child@1.0.0 for a new dependency."
+        )
+    );
+}
+
+#[test]
+fn audit_added_dependencies_compact_prioritizes_selected_branch_problems() {
+    let evidence = addition_evidence();
+    let clean = &evidence["added_dependencies"][0];
+    let incomplete = &evidence["search_details"][1]["added_dependency"];
+    let affected = &evidence["search_details"][0]["added_dependency"];
+    for (branches, expected) in [
+        (
+            json!([clean, incomplete]),
+            concat!(
+                "npm:demo 1.0.0 -> 1.1.1 in package-lock.json. Addresses GHSA-demo. ",
+                "Registry checks selected npm:router@2.3.0 for one of 2 new dependency requests. ",
+                "Dependency check for is-promise@4.0.0 — the dependency list was unavailable, ",
+                "so its dependencies could not be fully checked."
+            ),
+        ),
+        (
+            json!([clean, incomplete, affected]),
+            concat!(
+                "The registry check found that upgrading npm:demo from 1.0.0 to 1.1.1 in package-lock.json ",
+                "introduces a new dependency, npm:affected-descendant@1.0.0, affected by ",
+                "AUDIT-ADDED-affected-descendant. Addresses GHSA-demo."
+            ),
+        ),
+    ] {
+        let mut value = input();
+        value["remediation"]["recommendations"][0]["changes"][0]["added_dependencies"] = branches;
+        let doc = blocks(&value);
+        let r = &doc["remediation"]["recommendations"][0];
+        assert_eq!(r["details_recommended"], true);
+        assert_eq!(r["compact_summary"], expected);
+    }
+}
+
+#[test]
+fn audit_added_dependencies_advisory_precedes_unchecked_requirements() {
+    let evidence = addition_evidence();
+    let mut value = input();
+    let r = &mut value["remediation"]["recommendations"][0];
+    r["checks"]["requirements"] = "unchecked".into();
+    r["changes"][0]["added_dependencies"] =
+        json!([evidence["search_details"][0]["added_dependency"]]);
+    let doc = blocks(&value);
+    let r = &doc["remediation"]["recommendations"][0];
+    assert_eq!(r["details_recommended"], true);
+    assert_eq!(
+        r["compact_summary"],
+        concat!(
+            "The registry check found that upgrading npm:demo from 1.0.0 to 1.1.1 introduces ",
+            "a new dependency, npm:affected-descendant@1.0.0, affected by AUDIT-ADDED-affected-descendant."
+        )
+    );
+    assert_eq!(
+        r["checks"],
+        json!([
+            "The audit did not check whether the project's dependency requirements allow this change. The requirement check gives no reason."
+        ])
+    );
+}
+
+#[test]
+fn audit_added_dependencies_failed_checks_precede_unchecked_requirements() {
+    let evidence = addition_evidence();
+    let incomplete = &evidence["search_details"][1]["added_dependency"];
+    let mut unresolved = incomplete.clone();
+    unresolved["selected_version"] = Value::Null;
+    unresolved["coordinates"] = json!([]);
+    unresolved["issues"] = json!([{"operation":"selection","reason":"no_matching_version"}]);
+    for (branch, expected) in [
+        (
+            incomplete,
+            concat!(
+                "Registry checks selected npm:router@2.3.0 for a new dependency. ",
+                "Dependency check for is-promise@4.0.0 — the dependency list was unavailable, ",
+                "so its dependencies could not be fully checked."
+            ),
+        ),
+        (
+            &unresolved,
+            concat!(
+                "The release requires router ^2.0.0 as a new dependency. ",
+                "Registry version selection for npm:router — no published version matched the requirement."
+            ),
+        ),
+    ] {
+        let mut value = input();
+        let r = &mut value["remediation"]["recommendations"][0];
+        r["checks"]["requirements"] = "unchecked".into();
+        r["changes"][0]["added_dependencies"] = json!([branch]);
+        let doc = blocks(&value);
+        let r = &doc["remediation"]["recommendations"][0];
+        assert_eq!(r["details_recommended"], true);
+        assert_eq!(
+            r["compact_summary"],
+            format!("npm:demo 1.0.0 -> 1.1.1. {expected}")
+        );
+        assert_eq!(
+            r["checks"],
+            json!([
+                "The audit did not check whether the project's dependency requirements allow this change. The requirement check gives no reason."
+            ])
+        );
+    }
+}
+
+#[test]
+fn audit_added_dependencies_keeps_confirmed_target_problems_inline() {
+    let evidence = addition_evidence();
+    for (branches, added_problem) in [
+        (Value::Null, None),
+        (evidence["added_dependencies"].clone(), None),
+        (
+            json!([evidence["search_details"][0]["added_dependency"]]),
+            Some("affected by AUDIT-ADDED-affected-descendant."),
+        ),
+        (
+            json!([evidence["search_details"][1]["added_dependency"]]),
+            Some("Dependency check for is-promise@4.0.0"),
+        ),
+    ] {
+        let mut value = input();
+        let r = &mut value["remediation"]["recommendations"][0];
+        r["checks"]["advisories"] = "affected".into();
+        r["checks"]["requirements"] = "blocked".into();
+        r["checks"]["release_availability"] = "unverified".into();
+        if !branches.is_null() {
+            r["changes"][0]["added_dependencies"] = branches;
+        }
+        let doc = blocks(&value);
+        let r = &doc["remediation"]["recommendations"][0];
+        let summary = r["compact_summary"].as_str().expect("summary");
+        if let Some(added_problem) = added_problem {
+            assert!(summary.contains(added_problem), "{summary}");
+        }
+        assert!(
+            summary.ends_with(concat!(
+                "A proposed version is still affected by known advisories. ",
+                "The upgrade conflicts with dependency requirements."
+            )),
+            "{summary}"
+        );
+        assert!(
+            !summary.contains("confirm that the proposed versions are available"),
+            "{summary}"
+        );
+        assert_eq!(r["details_recommended"], true);
+        assert_eq!(
+            r["checks"],
+            json!([
+                "A proposed version is still affected by known advisories.",
+                "The upgrade conflicts with dependency requirements.",
+                "The report did not confirm that the proposed versions are available. The release check gives no reason for the missing confirmation."
+            ])
+        );
+    }
+}
+
+#[test]
+fn audit_added_dependencies_advisory_keeps_concrete_project_edit_conditional() {
+    let evidence = addition_evidence();
+    let mut value = input_with_project_edit();
+    let r = &mut value["remediation"]["recommendations"][0];
+    r["changes"][0]["added_dependencies"] =
+        json!([evidence["search_details"][0]["added_dependency"]]);
+    let doc = blocks(&value);
+    let r = &doc["remediation"]["recommendations"][0];
+    assert_eq!(r["details_recommended"], true);
+    assert_eq!(
+        r["compact_summary"],
+        concat!(
+            "The registry check found that upgrading npm:demo from 1.0.0 to 1.1.1 introduces ",
+            "a new dependency, npm:affected-descendant@1.0.0, affected by AUDIT-ADDED-affected-descendant. ",
+            "Applying the proposal requires updating the version constraint for demo in package.json (currently ^1.0)."
         )
     );
 }
@@ -266,6 +492,17 @@ fn audit_added_dependencies_compact_names_obstacle_when_no_change_was_selected()
         assert_eq!(
             r["compact_summary"],
             format!("The service could not determine a mitigation. {expected}")
+        );
+        let searches = &r["search_explanations"];
+        assert!(
+            searches[0]["details"]
+                .to_string()
+                .contains("The project installer may select")
+        );
+        assert!(
+            !searches[1]["details"]
+                .to_string()
+                .contains("The project installer may select")
         );
     }
 }
